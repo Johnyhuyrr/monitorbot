@@ -198,9 +198,9 @@ def test_429_pauses_reads_then_resumes(env):
     assert lookup("a").state == instagram.UNKNOWN
     snap = lookup("b")                                       # inside the pause
     assert snap.state == instagram.UNKNOWN
-    assert "rate limiting" in snap.note
+    assert "Next try in" in snap.note
     assert env.ig.profile_reads == ["a"]                     # b never went out
-    env.clock.advance(instagram.cooldown_remaining() + 1)
+    env.clock.advance(instagram.cooldown_remaining("api") + 1)
     assert lookup("b").state == instagram.OK
 
 
@@ -209,7 +209,7 @@ def test_pause_grows_and_is_capped(env):
     pauses = []
     for _ in range(12):
         lookup("a")
-        pauses.append(instagram.cooldown_remaining())
+        pauses.append(instagram.cooldown_remaining("api"))
         env.clock.advance(pauses[-1] + 1)
     assert pauses[1] > pauses[0]
     assert max(pauses) <= instagram.COOLDOWN_MAX_SECONDS
@@ -218,7 +218,7 @@ def test_pause_grows_and_is_capped(env):
 def test_retry_after_is_honoured(env):
     env.ig.set("a", httpx.Response(429, json={}, headers={"Retry-After": "300"}))
     lookup("a")
-    assert 299 <= instagram.cooldown_remaining() <= 300
+    assert 299 <= instagram.cooldown_remaining("api") <= 300
 
 
 def test_concurrency_is_bounded(env, monkeypatch):
@@ -297,3 +297,136 @@ def test_no_profile_picture(env):
     snap = lookup("blank")
     assert snap.state == instagram.OK and snap.avatar is None
     assert env.ig.avatar_reads == []
+
+
+# ------------------------------------------- fallback: the profile page
+
+from conftest import profile_page  # noqa: E402
+
+
+def test_api_401_falls_back_to_the_profile_page(env):
+    """What happened on the first real run: the API answered 401."""
+    env.ig.set("j00hnyx", (401, {"message": "Please wait a few minutes", "status": "fail"}))
+    env.ig.set_page("j00hnyx", (200, profile_page("j00hnyx", name="John", followers="12.3K",
+                                                  following="1,001", posts="42")))
+    snap = lookup("j00hnyx")
+    assert snap.state == instagram.OK and snap.source == "page"
+    assert (snap.followers, snap.following, snap.posts) == (12_300, 1_001, 42)
+    assert snap.full_name == "John"
+    assert snap.avatar == AVATAR                           # og:image, allowed host
+    assert snap.user_id is None and snap.private is None and snap.verified is False
+    assert snap.headline == "Reachable"
+
+
+def test_page_is_not_read_when_the_api_answers(env):
+    env.ig.set("fine", (200, profile("fine")))
+    env.ig.set("gone", (404, {}))
+    env.ig.set("broken", (503, {}))
+    env.ig.set("offline", httpx.ConnectError("down"))
+    for handle in ("fine", "gone", "broken", "offline"):
+        lookup(handle)
+    assert env.ig.page_reads == []
+
+
+def test_while_the_api_is_paused_only_the_page_is_read(env):
+    env.ig.set("a", (429, {}))
+    env.ig.set_page("a", (200, profile_page("a")))
+    env.ig.set_page("b", (200, profile_page("b")))
+    assert lookup("a").state == instagram.OK
+    assert lookup("b").state == instagram.OK
+    assert env.ig.profile_reads == ["a"]                   # API not retried during pause
+    assert env.ig.page_reads == ["a", "b"]
+
+
+def test_page_id_and_private_flag_are_used_when_present(env):
+    env.ig.set("p", (401, {}))
+    env.ig.set_page("p", (200, profile_page("p", user_id="17841400000000123", private=True)))
+    snap = lookup("p")
+    assert snap.user_id == "17841400000000123" and snap.private is True
+
+
+def test_page_without_a_display_name(env):
+    env.ig.set("noname", (401, {}))
+    env.ig.set_page("noname", (200, profile_page("noname", name=None)))
+    snap = lookup("noname")
+    assert snap.state == instagram.OK and snap.full_name is None
+
+
+def test_page_404_is_gone(env):
+    env.ig.set("vanished", (401, {}))
+    env.ig.set_page("vanished", (404, b"<html></html>"))
+    assert lookup("vanished").state == instagram.GONE
+
+
+def test_page_not_available_text_is_gone(env):
+    env.ig.set("vanished", (401, {}))
+    env.ig.set_page("vanished", (200, b"<html><body>Sorry, this page isn't available."
+                                      b"</body></html>"))
+    assert lookup("vanished").state == instagram.GONE
+
+
+@pytest.mark.parametrize("page", [
+    (200, b"<html><head><title>Instagram</title></head><body>Log in</body></html>"),
+    (429, b""),
+    (401, b""),
+    (500, b""),
+    (200, b"\x89PNG not html"),
+    (200, profile_page("someone.else")),                    # page about another handle
+    (200, b'<meta property="og:description" content="Followers? who knows" />'),
+])
+def test_page_that_cannot_answer_is_unknown_never_gone(env, page):
+    env.ig.set("x.y", (401, {}))
+    env.ig.set_page("x.y", page)
+    snap = lookup("x.y")
+    assert snap.state == instagram.UNKNOWN
+    assert not instagram._cache
+
+
+def test_login_redirect_on_the_page_is_unknown_and_pauses_the_page(env):
+    env.ig.set("x.y", (401, {}))
+    redirect = httpx.Response(302, headers={"Location":
+                                            "https://www.instagram.com/accounts/login/?next=/x.y/"})
+    env.ig.set_page("x.y", redirect)
+    env.ig.pages["accounts/login"] = [(200, b"<html>Log in</html>")]
+    snap = lookup("x.y")
+    assert snap.state == instagram.UNKNOWN
+    assert instagram.cooldown_remaining("page") > 0
+    assert "login" in snap.note.lower()
+
+
+def test_both_sources_refusing_keeps_the_api_reason(env):
+    env.ig.set("x.y", (401, {}))
+    env.ig.set_page("x.y", (429, b""))
+    snap = lookup("x.y")
+    assert snap.state == instagram.UNKNOWN
+    assert snap.note == instagram.NOTE_LOGIN                 # 401 = login wanted, not "rate limit"
+    assert instagram.cooldown_remaining("api") > 0 and instagram.cooldown_remaining("page") > 0
+    reads = (len(env.ig.profile_reads), len(env.ig.page_reads))
+    lookup("x.y")
+    assert (len(env.ig.profile_reads), len(env.ig.page_reads)) == reads   # both paused
+
+
+def test_429_note_still_says_rate_limit(env):
+    env.ig.set("x.y", (429, {}))
+    assert lookup("x.y").note == instagram.NOTE_THROTTLED
+
+
+def test_fallback_can_be_switched_off(env, monkeypatch):
+    monkeypatch.setattr(instagram, "PAGE_FALLBACK", False)
+    env.ig.set("x.y", (401, {}))
+    env.ig.set_page("x.y", (200, profile_page("x.y")))
+    assert lookup("x.y").state == instagram.UNKNOWN
+    assert env.ig.page_reads == []
+
+
+def test_page_avatar_from_unexpected_host_is_ignored(env):
+    env.ig.set("x.y", (401, {}))
+    env.ig.set_page("x.y", (200, profile_page("x.y", pic="https://evil.example/a.jpg")))
+    snap = lookup("x.y")
+    assert snap.state == instagram.OK and snap.avatar is None and env.ig.avatar_reads == []
+
+
+@pytest.mark.parametrize("text,value", [("1,234", 1234), ("12.3K", 12_300), ("2.3M", 2_300_000),
+                                        ("987", 987), ("1B", 1_000_000_000), ("abc", None)])
+def test_page_count_formats(text, value):
+    assert instagram._count(text) == value

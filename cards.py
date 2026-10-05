@@ -228,7 +228,7 @@ def render_profile_card(
     following: Optional[int] = None,
     posts: Optional[int] = None,
     verified: bool = False,
-    private: bool = False,
+    private: Optional[bool] = False,
     avatar_bytes: Optional[bytes] = None,
     state: str = "ok",          # ok | gone | unknown
     note: Optional[str] = None,
@@ -287,8 +287,9 @@ def render_profile_card(
     pill_font = regular(24)
     pill_x = text_x
     if state == "ok":
-        pill_x = _pill(draw, pill_x, 300, "Private" if private else "Public",
-                       AMBER if private else GREEN, pill_font)
+        if private is not None:  # None: the source did not say, so no pill
+            pill_x = _pill(draw, pill_x, 300, "Private" if private else "Public",
+                           AMBER if private else GREEN, pill_font)
         if verified:
             pill_x = _pill(draw, pill_x, 300, "Verified", IG_BLUE, pill_font)
     elif state == "gone":

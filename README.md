@@ -118,6 +118,13 @@ If the post fails, the job stays active and the bot retries on the next check. A
 
 **Rename and handle takeover.** The numeric Instagram ID is saved with each job (`ig_user_id`). If an Unban job's handle comes back owned by a *different* ID, someone else has taken the name. The bot does **not** auto-complete that job: it shows "Handle now on a different account" on the dashboard and leaves the decision to a person.
 
+**When Instagram refuses the API.** Some connections get HTTP 401 ("log in first") or 429 from Instagram's profile API. The bot then reads the public profile page, `instagram.com/<name>/`, which Instagram limits separately. You can turn this off with `INSTAGRAM_PAGE_FALLBACK=false`. That page gives the counts, the display name and the picture, but usually not the numeric ID, the private/public status or the verified tick, so the bot doesn't show those. Two safety rules apply:
+
+- **No ID, no auto-complete.** A page read without an ID never auto-completes an Unban job that already has a saved ID, because it can't prove it's the same account. The dashboard shows "Reachable · same account not confirmed", and a person can close the job with `/complete`.
+- **"Not reachable" needs a clear answer.** A page that can't answer (a login screen, an error, someone else's profile) is "Could not check", never "Not reachable".
+
+The page's format isn't documented by Instagram. It was tested against copies of its known layout, and might also be login-walled on your connection.
+
 **Not hammering Instagram.** The bot limits its own traffic in three ways:
 
 - **Bot-wide cap.** Every Instagram request goes through one gate: at most 3 at a time, started at least 1 s apart. This covers the monitor, `/bancheck` and `/newjob` together.
@@ -221,7 +228,8 @@ Check `logs/bot.log` first. Repeated problems, such as a missing channel or a fa
 | Another copy of this bot is already ... | Close the other copy. Two copies would corrupt your data. |
 | Dashboard, guild …: missing permission | Give the bot View Channel, Send Messages, Embed Links and Attach Files in that channel. |
 | … no monitor channel set up (/setup) | Run `/setup` in that server. Unban jobs are only checked once it has a monitor channel. |
-| Instagram rate limit … Pausing Instagram reads | This is normal. The bot waits and then resumes by itself. |
+| Instagram refused the API (HTTP 401) … Pausing API reads | Instagram wants a login from this connection. The bot falls back to the profile page and resumes the API by itself later. |
+| Read … from the public profile page | The fallback worked. |
 | … old job(s) have no server recorded | Set `LEGACY_GUILD_ID` in `.env`. |
 
 ## 11. Known limitations

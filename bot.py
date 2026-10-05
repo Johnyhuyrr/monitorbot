@@ -84,6 +84,9 @@ BRAND = os.getenv("BRAND_NAME", "").strip() or "Zade Meadows"
 # this server; if unset, they are adopted only when exactly one server has
 # run /setup, and otherwise stay hidden from every server.
 LEGACY_GUILD_ID = os.getenv("LEGACY_GUILD_ID", "").strip()
+# When Instagram's API refuses this connection, read the public profile page
+# instead. Set to false to use the API only.
+instagram.PAGE_FALLBACK = os.getenv("INSTAGRAM_PAGE_FALLBACK", "true").strip().lower() != "false"
 
 REFRESH_SECONDS = 60          # safety-net redraw
 MAX_ACTIVE_SHOWN = 10         # keep embeds under Discord's 1024-char field cap
@@ -273,7 +276,8 @@ def account_row(snapshot: instagram.Snapshot) -> str:
     """One line about the account, safe to post in a channel."""
     bits = [snapshot.headline]
     if snapshot.state == instagram.OK:
-        bits.append("private" if snapshot.private else "public")
+        if snapshot.private is not None:
+            bits.append("private" if snapshot.private else "public")
         if snapshot.verified:
             bits.append("verified")
     return f"**Account:** {' · '.join(bits)}"
@@ -519,6 +523,7 @@ MONITOR_STATE_TEXT = {
     instagram.GONE: "Not reachable yet",
     instagram.UNKNOWN: "Could not check",
     "mismatch": "Handle now on a different account",
+    "unconfirmed": "Reachable · same account not confirmed",
 }
 
 
@@ -928,6 +933,21 @@ def different_account(job: dict, snapshot: instagram.Snapshot) -> bool:
     return bool(stored and seen and stored != seen)
 
 
+def identity_unconfirmed(job: dict, snapshot: instagram.Snapshot) -> bool:
+    """The job knows which account it is about, but this read (typically
+    from the profile page) carries no numeric id to compare - so it cannot
+    prove the reachable profile is still that same account."""
+    return bool(job.get("ig_user_id")) and not snapshot.user_id
+
+
+def identity_state(job: dict, snapshot: instagram.Snapshot) -> str:
+    if different_account(job, snapshot):
+        return "mismatch"
+    if identity_unconfirmed(job, snapshot):
+        return "unconfirmed"
+    return instagram.OK
+
+
 def apply_completion(job: dict, now: datetime, duration: float,
                      snapshot: instagram.Snapshot, closed_by: Optional[str] = None) -> None:
     job["status"] = "completed"
@@ -954,6 +974,10 @@ def record_monitor_state(job: dict, state: str, note: str = "") -> None:
     elif state == instagram.UNKNOWN:
         log.info("Monitor: job %s (@%s) could not be checked (%s); staying active.",
                  job.get("id"), job.get("username"), note or "no detail")
+    elif state == "unconfirmed":
+        log.info("Monitor: job %s - @%s is reachable, but this read has no account id to "
+                 "confirm it is the same account. Not completing automatically yet.",
+                 job.get("id"), job.get("username"))
     elif state == "mismatch":
         log.warning("Monitor: job %s - @%s now belongs to a different Instagram account "
                     "(id changed). Not completing automatically; a person must decide.",
@@ -1036,8 +1060,9 @@ async def auto_complete_job(job: dict, snapshot: instagram.Snapshot) -> None:
             return  # already finished by /complete while this read was in flight
         if snapshot.state != instagram.OK:
             return  # only a confirmed reachable profile closes an Unban job
-        if different_account(job, snapshot):
-            record_monitor_state(job, "mismatch")
+        identity = identity_state(job, snapshot)
+        if identity != instagram.OK:
+            record_monitor_state(job, identity)
             return
 
         now = datetime.now(timezone.utc)
@@ -1099,8 +1124,7 @@ async def check_job(job: dict, semaphore: asyncio.Semaphore) -> None:
             record_monitor_state(job, snapshot.state, snapshot.note)
             return
 
-        record_monitor_state(job, "mismatch" if different_account(job, snapshot)
-                             else instagram.OK)
+        record_monitor_state(job, identity_state(job, snapshot))
         await auto_complete_job(job, snapshot)
     except Exception as exc:
         # A broken job record or an unexpected error later must not be

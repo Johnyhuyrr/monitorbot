@@ -420,3 +420,83 @@ def test_same_account_with_stored_id_completes(env):
     env.ig.set("same", (200, profile("same", user_id="3333")))
     run(env.tick())
     assert B.jobs[0]["status"] == "completed"
+
+
+# ------------------------------------- reads from the public profile page
+
+from conftest import profile_page  # noqa: E402
+
+
+def test_unban_completes_from_the_profile_page_when_the_api_refuses(env):
+    """An Unban job opened while the account was gone (no stored id) is
+    completed by a page read when the API answers 401."""
+    channel = env.dc.setup(1)
+    env.job("ZM-0001", "came.back")
+    env.ig.set("came.back", (401, {}))
+    env.ig.set_page("came.back", (200, profile_page("came.back", followers="5")))
+    run(env.tick())
+    job = B.jobs[0]
+    assert job["status"] == "completed"
+    assert "ig_user_id" not in job                       # the page gave none; none invented
+    post = [m for m in channel.sent if (m.embed.title or "").startswith("Job Complete")]
+    assert len(post) == 1 and len(post[0].files) == 1
+    assert "Reachable" in post[0].embed.description
+    assert "public" not in post[0].embed.description     # private/public unknown: not claimed
+
+
+def test_page_read_without_id_does_not_complete_a_job_with_a_known_id(env, logs):
+    channel = env.dc.setup(1)
+    env.job("ZM-0001", "known", ig_user_id="1111")
+    env.ig.set("known", (401, {}))
+    env.ig.set_page("known", (200, profile_page("known")))
+    for _ in range(3):
+        run(env.tick())
+    assert B.jobs[0]["status"] == "active"
+    assert not any((m.embed.title or "").startswith("Job Complete") for m in channel.sent)
+    assert B.job_state_text(B.jobs[0]) == "Reachable · same account not confirmed"
+    assert sum("no account id to confirm" in line for line in logs) == 1
+
+
+def test_page_read_with_matching_id_completes_a_job_with_a_known_id(env):
+    env.dc.setup(1)
+    env.job("ZM-0001", "known", ig_user_id="1111")
+    env.ig.set("known", (401, {}))
+    env.ig.set_page("known", (200, profile_page("known", user_id="1111")))
+    run(env.tick())
+    assert B.jobs[0]["status"] == "completed"
+
+
+def test_page_read_with_other_id_is_a_mismatch(env):
+    env.dc.setup(1)
+    env.job("ZM-0001", "known", ig_user_id="1111")
+    env.ig.set("known", (401, {}))
+    env.ig.set_page("known", (200, profile_page("known", user_id="2222")))
+    run(env.tick())
+    assert B.jobs[0]["status"] == "active"
+    assert B.job_state_text(B.jobs[0]).startswith("Handle now on")
+
+
+def test_bancheck_via_profile_page(env):
+    env.ig.set("j00hnyx", (401, {}))
+    env.ig.set_page("j00hnyx", (200, profile_page("j00hnyx")))
+    it = FakeInteraction(1)
+    run(B.run_ban_check(it, "j00hnyx"))
+    embed = it.followup.sent[0].embed
+    assert "Reachable" in embed.description and embed.colour.value == B.COLOR_DONE
+    assert len(it.followup.sent[0].files) == 1
+
+
+def test_bancheck_401_wording_says_login_not_rate_limit(env):
+    env.ig.set("j00hnyx", (401, {}))
+    env.ig.set_page("j00hnyx", (429, b""))
+    it = FakeInteraction(1)
+    run(B.run_ban_check(it, "j00hnyx"))
+    text = it.followup.sent[0].embed.description
+    assert "Could not check" in text and "asking for a login" in text
+    assert "rate limiting" not in text
+
+
+def test_card_renders_without_private_status():
+    png = B.cards.render_profile_card("someone", followers=1, following=2, posts=3,
+                                      private=None, state="ok")
+    assert png and png[:4] == b"\x89PNG"

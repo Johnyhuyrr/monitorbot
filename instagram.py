@@ -21,12 +21,21 @@ Three things keep this module from hammering Instagram:
     "please wait" reply) every read pauses for a while, doubling up to
     COOLDOWN_MAX_SECONDS, and honouring Retry-After. A cooldown is time
     limited and is never stored as an account's state.
+
+Two ways in, each with its own cooldown:
+  * "api"  - the JSON endpoint instagram.com itself uses. Complete data,
+    including the numeric user id. Tried first.
+  * "page" - the public profile page, instagram.com/<name>/. Only used when
+    the API refuses us (401/403/429, login wall, "please wait"); Instagram
+    limits it separately. Counts, name and picture come from its preview
+    tags; the numeric id and private/verified status often do not.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import re
 import time
@@ -44,6 +53,21 @@ except Exception:  # pragma: no cover
 log = logging.getLogger("zm.instagram")
 
 PROFILE_ENDPOINT = "https://www.instagram.com/api/v1/users/web_profile_info/?username={}"
+PROFILE_PAGE = "https://www.instagram.com/{}/"
+
+# Fall back to the public profile page when the API refuses us. bot.py sets
+# this from INSTAGRAM_PAGE_FALLBACK in .env.
+PAGE_FALLBACK = True
+
+PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+PAGE_MAX_BYTES = 3_000_000
 
 # This app id is what instagram.com itself sends for logged-out profile reads.
 HEADERS = {
@@ -86,6 +110,9 @@ _PROFILE_LINK = re.compile(
 
 NOTE_GONE = "Same answer Instagram gives for a delete, a rename or a deactivation."
 NOTE_THROTTLED = "Instagram is rate limiting anonymous checks. Try again shortly."
+NOTE_LOGIN = ("Instagram is asking for a login before it shows profiles to this "
+              "connection. Try again later.")
+NOTE_FROM_PAGE = "Read from the public profile page."
 NOTE_OFFLINE = "Could not reach Instagram from this machine."
 NOTE_TIMEOUT = "Instagram did not answer in time."
 NOTE_MALFORMED = "Instagram sent a reply that could not be understood."
@@ -104,13 +131,14 @@ class Snapshot:
     user_id: Optional[str] = None
     full_name: Optional[str] = None
     verified: bool = False
-    private: bool = False
+    private: Optional[bool] = False      # None: the source did not say
     followers: Optional[int] = None
     following: Optional[int] = None
     posts: Optional[int] = None
     avatar: Optional[bytes] = field(default=None, repr=False)
     avatar_url: Optional[str] = field(default=None, repr=False)
     note: str = ""
+    source: str = "api"                  # "api" or "page"
 
     @property
     def reachable(self) -> bool:
@@ -177,42 +205,54 @@ def _remember(snapshot: Snapshot, handle: str) -> Snapshot:
 # Rate limiting: one gate for the whole process, plus a cooldown
 # --------------------------------------------------------------------------
 
-_cooldown_until = 0.0
-_cooldown_step = 0
+SOURCES = ("api", "page")
+_cooldown: dict[str, list] = {source: [0.0, 0] for source in SOURCES}  # [until, step]
 
 
-def cooldown_remaining() -> float:
-    return max(0.0, _cooldown_until - _clock())
+def _sources() -> tuple[str, ...]:
+    return SOURCES if PAGE_FALLBACK else ("api",)
+
+
+def cooldown_remaining(source: Optional[str] = None) -> float:
+    """Seconds until Instagram may be asked again - by one source, or (no
+    argument) by whichever usable source frees up first."""
+    now = _clock()
+    if source is not None:
+        return max(0.0, _cooldown[source][0] - now)
+    return min(max(0.0, _cooldown[name][0] - now) for name in _sources())
 
 
 def reset_rate_limit() -> None:
-    global _cooldown_until, _cooldown_step
-    _cooldown_until, _cooldown_step = 0.0, 0
+    for state in _cooldown.values():
+        state[0], state[1] = 0.0, 0
 
 
-def _note_throttle(reason: str, retry_after: Optional[float] = None) -> None:
-    global _cooldown_until, _cooldown_step
-    _cooldown_step = min(_cooldown_step + 1, 10)
-    delay = min(COOLDOWN_BASE_SECONDS * 2 ** (_cooldown_step - 1), COOLDOWN_MAX_SECONDS)
+def _note_throttle(reason: str, retry_after: Optional[float] = None,
+                   source: str = "api") -> None:
+    state = _cooldown[source]
+    state[1] = min(state[1] + 1, 10)
+    delay = min(COOLDOWN_BASE_SECONDS * 2 ** (state[1] - 1), COOLDOWN_MAX_SECONDS)
     if retry_after:
         delay = min(max(delay, retry_after), COOLDOWN_MAX_SECONDS)
-    _cooldown_until = max(_cooldown_until, _clock() + delay)
-    log.warning("Instagram rate limit (%s). Pausing Instagram reads for %ds.", reason, int(delay))
+    state[0] = max(state[0], _clock() + delay)
+    what = "profile page" if source == "page" else "API"
+    log.warning("Instagram refused the %s (%s). Pausing %s reads for %ds.",
+                what, reason, what, int(delay))
 
 
-def _note_success() -> None:
+def _note_success(source: str = "api") -> None:
     # A clean answer means the next throttle starts again from the short
     # pause. A pause already running is left alone - requests that were in
     # flight together can finish in any order.
-    global _cooldown_step
-    _cooldown_step = 0
+    _cooldown[source][1] = 0
 
 
-def _throttled_snapshot(handle: str) -> Snapshot:
-    wait = int(cooldown_remaining())
+def _throttled_snapshot(handle: str, source: Optional[str] = None) -> Snapshot:
+    wait = int(cooldown_remaining(source))
     when = f"about {max(1, round(wait / 60))} min" if wait >= 60 else f"about {max(wait, 1)} s"
     return Snapshot(handle, UNKNOWN,
-                    note=f"Instagram is rate limiting anonymous checks. Next try in {when}.")
+                    note=f"Instagram is refusing anonymous checks from this connection "
+                         f"for now. Next try in {when}.")
 
 
 class _Gate:
@@ -252,8 +292,9 @@ _gate = _Gate()
 _transport: Any = None
 
 
-def _client() -> "httpx.AsyncClient":
-    kwargs: dict[str, Any] = {"timeout": TIMEOUT, "follow_redirects": True, "headers": HEADERS}
+def _client(headers: Optional[dict] = None) -> "httpx.AsyncClient":
+    kwargs: dict[str, Any] = {"timeout": TIMEOUT, "follow_redirects": True,
+                              "headers": headers or HEADERS}
     if _transport is not None:
         kwargs["transport"] = _transport
     return httpx.AsyncClient(**kwargs)
@@ -375,9 +416,225 @@ async def _download_avatar(client: "httpx.AsyncClient", url: Optional[str],
 # Public API
 # --------------------------------------------------------------------------
 
+async def _read_api(handle: str, want_avatar: bool) -> tuple[Snapshot, bool]:
+    """One read of the JSON endpoint. Returns (snapshot, refused): refused
+    means Instagram declined to answer us, so the page may be worth a try."""
+    try:
+        async with _client() as client:
+            async with _gate.slot():
+                # Re-check: a request queued behind one that just got a 429
+                # must not go out anyway.
+                if cooldown_remaining("api") > 0:
+                    return _throttled_snapshot(handle, "api"), True
+                reply = await client.get(PROFILE_ENDPOINT.format(quote(handle, safe="._")))
+
+            status = reply.status_code
+            if status == 404:
+                _note_success("api")
+                return _remember(Snapshot(handle, GONE, note=NOTE_GONE), handle), False
+
+            # 401/403 = logged-out reads refused, 429 = too many. Both mean
+            # "we do not know", which is not the same as "gone".
+            if status in (401, 403, 429):
+                log.info("Instagram refused an anonymous read of %s (HTTP %s).", handle, status)
+                _note_throttle(f"HTTP {status}", _retry_after(reply), "api")
+                note = NOTE_THROTTLED if status == 429 else NOTE_LOGIN
+                return Snapshot(handle, UNKNOWN, note=note), True
+
+            if status >= 500:
+                log.info("Instagram server error reading %s (HTTP %s).", handle, status)
+                return Snapshot(handle, UNKNOWN, note="Instagram is having trouble."), False
+
+            if status != 200:
+                log.info("Unexpected HTTP %s reading %s.", status, handle)
+                return Snapshot(handle, UNKNOWN,
+                                note=f"Unexpected reply from Instagram (HTTP {status})."), False
+
+            try:
+                payload = reply.json()
+            except Exception:
+                # A login wall serves HTML with a 200. Not a ban.
+                log.info("Instagram served a non-JSON page (login wall) for %s.", handle)
+                _note_throttle("login wall", source="api")
+                return Snapshot(handle, UNKNOWN, note=NOTE_LOGIN), True
+
+            snapshot = _parse(handle, payload)
+            if snapshot.state == UNKNOWN:
+                if snapshot.note == NOTE_THROTTLED:
+                    _note_throttle("please-wait reply", source="api")
+                    return snapshot, True
+                log.info("Unusable reply for %s: %s", handle, snapshot.note)
+                return snapshot, False
+
+            _note_success("api")
+            if snapshot.state == OK and want_avatar:
+                snapshot.avatar = await _download_avatar(client, snapshot.avatar_url, handle)
+            return _remember(snapshot, handle), False
+
+    except _timeout_errors():
+        log.info("Lookup of %s timed out.", handle)
+        return Snapshot(handle, UNKNOWN, note=NOTE_TIMEOUT), False
+    except Exception as exc:
+        log.info("Lookup of %s failed: %s: %s", handle, type(exc).__name__, exc)
+        return Snapshot(handle, UNKNOWN, note=NOTE_OFFLINE), False
+
+
+# --------------------------------------------------------------------------
+# The public profile page
+# --------------------------------------------------------------------------
+
+_META_TAG = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_ATTRIBUTE = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
+_COUNTS = re.compile(
+    r"([\d.,]+\s*[KMB]?)\s+Followers?\s*,\s*([\d.,]+\s*[KMB]?)\s+Following\s*,\s*"
+    r"([\d.,]+\s*[KMB]?)\s+Posts?\b", re.IGNORECASE)
+_HANDLE_IN_TEXT = re.compile(r"\(@([A-Za-z0-9._]{1,30})\)")
+_HANDLE_AT_START = re.compile(r"^@([A-Za-z0-9._]{1,30})\b")
+_PAGE_ID_PATTERNS = (
+    re.compile(r'<meta[^>]+property="instapp:owner_user_id"[^>]+content="(\d{3,25})"'),
+    re.compile(r'"profilePage_(\d{3,25})"'),
+    re.compile(r'"profile_id"\s*:\s*"(\d{3,25})"'),
+)
+_PAGE_GONE_PHRASES = ("Sorry, this page isn't available", "Sorry, this page isn&#039;t available",
+                      "Page Not Found")
+
+
+def _meta_tags(text: str) -> dict[str, str]:
+    tags: dict[str, str] = {}
+    for tag in _META_TAG.findall(text):
+        attrs = {k.lower(): v for k, v in _ATTRIBUTE.findall(tag)}
+        key = attrs.get("property") or attrs.get("name")
+        if key and "content" in attrs and key not in tags:
+            tags[key] = html.unescape(attrs["content"])
+    return tags
+
+
+def _count(text: str) -> Optional[int]:
+    """'1,234' -> 1234, '12.3K' -> 12300, '2.3M' -> 2300000."""
+    raw = text.replace(" ", "").upper()
+    scale = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(raw[-1:], 1)
+    number = raw[:-1] if scale != 1 else raw
+    try:
+        if scale == 1:
+            return int(number.replace(",", "").replace(".", ""))
+        return int(round(float(number.replace(",", "")) * scale))
+    except ValueError:
+        return None
+
+
+def _parse_page(handle: str, text: str) -> Snapshot:
+    """Map a profile page to a Snapshot. OK needs the preview tags of THIS
+    handle with all three counts; anything less is UNKNOWN."""
+    tags = _meta_tags(text)
+    description = tags.get("og:description") or tags.get("description") or ""
+    title = tags.get("og:title") or ""
+
+    counts = _COUNTS.search(description)
+    named = (_HANDLE_IN_TEXT.search(title) or _HANDLE_IN_TEXT.search(description)
+             or _HANDLE_AT_START.search(title.strip()))
+    if not counts or not named:
+        if not title and any(phrase in text for phrase in _PAGE_GONE_PHRASES):
+            return Snapshot(handle, GONE, note=NOTE_GONE, source="page")
+        return Snapshot(handle, UNKNOWN, note=NOTE_LOGIN, source="page")
+    if named.group(1).lower() != handle.lower():
+        return Snapshot(handle, UNKNOWN, source="page",
+                        note="Instagram answered for a different username.")
+
+    # "Name (@handle) • Instagram photos and videos", or the description's
+    # "... See Instagram photos and videos from Name (@handle)".
+    full_name = None
+    source_text = title if "(@" in title else description
+    if "(@" in source_text:
+        head = source_text.split("(@")[0]
+        if " from " in head:
+            head = head.rsplit(" from ", 1)[1]
+        head = head.strip(" •·-\u2022")
+        if head and not _COUNTS.search(head):
+            full_name = head
+
+    user_id = None
+    for pattern in _PAGE_ID_PATTERNS:
+        found = pattern.search(text)
+        if found:
+            user_id = found.group(1)
+            break
+
+    private: Optional[bool] = None
+    if '"is_private":true' in text:
+        private = True
+    elif '"is_private":false' in text:
+        private = False
+
+    return Snapshot(
+        username=named.group(1),
+        state=OK,
+        user_id=user_id,
+        full_name=full_name,
+        verified=False,               # not reliably on the page; never guessed
+        private=private,
+        followers=_count(counts.group(1)),
+        following=_count(counts.group(2)),
+        posts=_count(counts.group(3)),
+        avatar_url=tags.get("og:image") or None,
+        note=NOTE_FROM_PAGE,
+        source="page",
+    )
+
+
+async def _read_page(handle: str, want_avatar: bool) -> Snapshot:
+    """One read of instagram.com/<handle>/. Never raises."""
+    try:
+        async with _client(PAGE_HEADERS) as client:
+            async with _gate.slot():
+                if cooldown_remaining("page") > 0:
+                    return _throttled_snapshot(handle, "page")
+                reply = await client.get(PROFILE_PAGE.format(quote(handle, safe="._")))
+
+            status = reply.status_code
+            final_path = str(getattr(getattr(reply, "url", None), "path", "") or "")
+            if status == 404:
+                _note_success("page")
+                return Snapshot(handle, GONE, note=NOTE_GONE, source="page")
+            if status in (401, 403, 429) or final_path.startswith(("/accounts/login",
+                                                                    "/challenge")):
+                _note_throttle(f"HTTP {status}" if status != 200 else "login redirect",
+                               _retry_after(reply), "page")
+                return Snapshot(handle, UNKNOWN, note=NOTE_LOGIN, source="page")
+            if status != 200:
+                return Snapshot(handle, UNKNOWN, source="page",
+                                note=f"Unexpected reply from Instagram (HTTP {status}).")
+
+            body = reply.content or b""
+            if len(body) > PAGE_MAX_BYTES:
+                return Snapshot(handle, UNKNOWN, note=NOTE_MALFORMED, source="page")
+            text = getattr(reply, "text", None)
+            if not isinstance(text, str):
+                text = body.decode("utf-8", "replace")
+
+            snapshot = _parse_page(handle, text)
+            if snapshot.state == UNKNOWN:
+                if snapshot.note == NOTE_LOGIN:
+                    _note_throttle("login wall", source="page")
+                return snapshot
+            _note_success("page")
+            if snapshot.state == OK and want_avatar:
+                snapshot.avatar = await _download_avatar(client, snapshot.avatar_url, handle)
+            return snapshot
+    except _timeout_errors():
+        return Snapshot(handle, UNKNOWN, note=NOTE_TIMEOUT, source="page")
+    except Exception as exc:
+        log.info("Profile page read of %s failed: %s: %s", handle, type(exc).__name__, exc)
+        return Snapshot(handle, UNKNOWN, note=NOTE_OFFLINE, source="page")
+
+
+# --------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------
+
 async def lookup(username: str, *, want_avatar: bool = True,
                  use_cache: bool = True) -> Snapshot:
-    """Read one public profile. Always returns a Snapshot, never raises."""
+    """Read one public profile. Always returns a Snapshot, never raises.
+    Tries the API; only if Instagram refuses it, tries the profile page."""
     raw = str(username).strip().lstrip("@")
     if not raw:
         return Snapshot(raw, UNKNOWN, note="No username given.")
@@ -393,66 +650,23 @@ async def lookup(username: str, *, want_avatar: bool = True,
         if hit is not None:
             return hit
 
-    if cooldown_remaining() > 0:
-        return _throttled_snapshot(handle)
+    if cooldown_remaining("api") <= 0:
+        primary, refused = await _read_api(handle, want_avatar)
+        if not refused:
+            return primary
+    else:
+        primary = _throttled_snapshot(handle, "api")
 
-    try:
-        async with _client() as client:
-            async with _gate.slot():
-                # Re-check: a request queued behind one that just got a 429
-                # must not go out anyway.
-                if cooldown_remaining() > 0:
-                    return _throttled_snapshot(handle)
-                reply = await client.get(PROFILE_ENDPOINT.format(quote(handle, safe="._")))
+    if PAGE_FALLBACK and cooldown_remaining("page") <= 0:
+        page = await _read_page(handle, want_avatar)
+        if page.state != UNKNOWN:
+            log.info("Read %s from the public profile page (API refused): %s.",
+                     handle, page.state)
+            return _remember(page, handle)
 
-            status = reply.status_code
-            if status == 404:
-                _note_success()
-                return _remember(Snapshot(handle, GONE, note=NOTE_GONE), handle)
-
-            # 401/403 = logged-out reads refused, 429 = too many. Both mean
-            # "we do not know", which is not the same as "gone".
-            if status in (401, 403, 429):
-                log.info("Instagram refused an anonymous read of %s (HTTP %s).", handle, status)
-                _note_throttle(f"HTTP {status}", _retry_after(reply))
-                return Snapshot(handle, UNKNOWN, note=NOTE_THROTTLED)
-
-            if status >= 500:
-                log.info("Instagram server error reading %s (HTTP %s).", handle, status)
-                return Snapshot(handle, UNKNOWN, note="Instagram is having trouble.")
-
-            if status != 200:
-                log.info("Unexpected HTTP %s reading %s.", status, handle)
-                return Snapshot(handle, UNKNOWN,
-                                note=f"Unexpected reply from Instagram (HTTP {status}).")
-
-            try:
-                payload = reply.json()
-            except Exception:
-                # A login wall serves HTML with a 200. Not a ban.
-                log.info("Instagram served a non-JSON page (login wall) for %s.", handle)
-                _note_throttle("login wall")
-                return Snapshot(handle, UNKNOWN, note=NOTE_THROTTLED)
-
-            snapshot = _parse(handle, payload)
-            if snapshot.state == UNKNOWN:
-                if snapshot.note == NOTE_THROTTLED:
-                    _note_throttle("please-wait reply")
-                else:
-                    log.info("Unusable reply for %s: %s", handle, snapshot.note)
-                return snapshot
-
-            _note_success()
-            if snapshot.state == OK and want_avatar:
-                snapshot.avatar = await _download_avatar(client, snapshot.avatar_url, handle)
-            return _remember(snapshot, handle)
-
-    except _timeout_errors():
-        log.info("Lookup of %s timed out.", handle)
-        return Snapshot(handle, UNKNOWN, note=NOTE_TIMEOUT)
-    except Exception as exc:
-        log.info("Lookup of %s failed: %s: %s", handle, type(exc).__name__, exc)
-        return Snapshot(handle, UNKNOWN, note=NOTE_OFFLINE)
+    # The API's own reason (login wanted / rate limited / pausing) is the
+    # most useful thing to show when the page could not answer either.
+    return primary
 
 
 async def lookup_many(usernames: list[str], *, want_avatar: bool = False,

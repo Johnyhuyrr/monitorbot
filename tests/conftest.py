@@ -67,12 +67,17 @@ class FakeInstagram:
 
     def __init__(self) -> None:
         self.script: dict[str, list] = {}
+        self.pages: dict[str, list] = {}       # instagram.com/<handle>/ replies
+        self.page_reads: list[str] = []
         self.profile_reads: list[str] = []
         self.avatar_reads: list[str] = []
         self.avatar_reply: Any = (200, AVATAR)
 
     def set(self, handle: str, *replies: Any) -> None:
         self.script[handle] = list(replies)
+
+    def set_page(self, handle: str, *replies: Any) -> None:
+        self.pages[handle] = list(replies)
 
     @staticmethod
     def _response(reply: Any) -> httpx.Response:
@@ -94,8 +99,40 @@ class FakeInstagram:
                 raise httpx.ConnectError("no script for " + handle)
             reply = seq.pop(0) if len(seq) > 1 else seq[0]
             return self._response(reply)
+        if request.url.host == "www.instagram.com":
+            handle = request.url.path.strip("/")
+            self.page_reads.append(handle)
+            seq = self.pages.get(handle)
+            if not seq:
+                raise httpx.ConnectError("no page script for " + handle)
+            reply = seq.pop(0) if len(seq) > 1 else seq[0]
+            return self._response(reply)
         self.avatar_reads.append(str(request.url))
         return self._response(self.avatar_reply)
+
+
+def profile_page(handle: str, *, name: Optional[str] = "Some Name",
+                 followers: str = "1,234", following: str = "56", posts: str = "7",
+                 user_id: Optional[str] = None, private: Optional[bool] = None,
+                 pic: Optional[str] = AVATAR_URL) -> bytes:
+    """A logged-out instagram.com/<handle>/ page, reduced to what matters:
+    the preview (og:) tags, attributes in Instagram's own order."""
+    who = f"{name} (@{handle})" if name else f"@{handle}"
+    desc = (f"{followers} Followers, {following} Following, {posts} Posts - "
+            f"See Instagram photos and videos from {who}")
+    extra = ""
+    if user_id:
+        extra += f'<meta property="instapp:owner_user_id" content="{user_id}" />'
+    if private is not None:
+        extra += f'<script>{{"is_private":{"true" if private else "false"}}}</script>'
+    image = f'<meta property="og:image" content="{pic}" />' if pic else ""
+    html_text = (
+        "<!DOCTYPE html><html><head>"
+        f'<meta property="og:title" content="{who} &#x2022; Instagram photos and videos" />'
+        f'<meta content="{desc}" property="og:description" />'
+        f"{image}{extra}</head><body></body></html>"
+    )
+    return html_text.encode()
 
 
 class Clock:
