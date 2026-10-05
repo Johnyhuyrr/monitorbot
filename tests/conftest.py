@@ -68,6 +68,9 @@ class FakeInstagram:
     def __init__(self) -> None:
         self.script: dict[str, list] = {}
         self.pages: dict[str, list] = {}       # instagram.com/<handle>/ replies
+        self.session: dict[str, list] = {}     # logged-in API replies
+        self.session_reads: list[str] = []
+        self.cookies_seen_elsewhere: list[str] = []
         self.page_reads: list[str] = []
         self.profile_reads: list[str] = []
         self.avatar_reads: list[str] = []
@@ -78,6 +81,9 @@ class FakeInstagram:
 
     def set_page(self, handle: str, *replies: Any) -> None:
         self.pages[handle] = list(replies)
+
+    def set_session(self, handle: str, *replies: Any) -> None:
+        self.session[handle] = list(replies)
 
     @staticmethod
     def _response(reply: Any) -> httpx.Response:
@@ -91,6 +97,17 @@ class FakeInstagram:
         return httpx.Response(status, content=body)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        cookie = request.headers.get("cookie", "")
+        if "web_profile_info" in request.url.path and "sessionid=" in cookie:
+            handle = request.url.params.get("username", "")
+            self.session_reads.append(handle)
+            seq = self.session.get(handle)
+            if not seq:
+                raise httpx.ConnectError("no session script for " + handle)
+            reply = seq.pop(0) if len(seq) > 1 else seq[0]
+            return self._response(reply)
+        if cookie:
+            self.cookies_seen_elsewhere.append(f"{request.url} {cookie}")
         if "web_profile_info" in request.url.path:
             handle = request.url.params.get("username", "")
             self.profile_reads.append(handle)
@@ -344,6 +361,8 @@ def env(tmp_path, monkeypatch) -> Env:
     monkeypatch.setattr(instagram, "_clock", clock)
     monkeypatch.setattr(instagram, "MIN_GAP_SECONDS", 0)
     monkeypatch.setattr(instagram, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(instagram, "SESSION_ID", "")
+    monkeypatch.setattr(instagram, "SESSION_MIN_GAP_SECONDS", 0)
     instagram._cache.clear()
     instagram.reset_rate_limit()
 

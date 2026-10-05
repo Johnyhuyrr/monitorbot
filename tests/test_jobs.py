@@ -500,3 +500,17 @@ def test_card_renders_without_private_status():
     png = B.cards.render_profile_card("someone", followers=1, following=2, posts=3,
                                       private=None, state="ok")
     assert png and png[:4] == b"\x89PNG"
+
+
+def test_unban_completes_through_the_logged_in_session(env, monkeypatch):
+    """The live situation: anonymous API 401, page login-walled, cookie set."""
+    monkeypatch.setattr(instagram, "SESSION_ID", "1234567890%3AAbCdEfGhIjKl%3A12%3AAYfake")
+    channel = env.dc.setup(1)
+    env.job("ZM-0001", "j00hnyx")
+    env.ig.set("j00hnyx", (401, {}))
+    env.ig.set_page("j00hnyx", (200, b"<html>Log in</html>"))
+    env.ig.set_session("j00hnyx", (200, profile("j00hnyx", user_id="777")))
+    run(env.tick())
+    job = B.jobs[0]
+    assert job["status"] == "completed" and job["ig_user_id"] == "777"
+    assert len([m for m in channel.sent if m.embed.title.startswith("Job Complete")]) == 1

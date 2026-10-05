@@ -125,6 +125,28 @@ If the post fails, the job stays active and the bot retries on the next check. A
 
 The page's format isn't documented by Instagram. It was tested against copies of its known layout, and might also be login-walled on your connection.
 
+**Logged-in reads (optional, last resort).** If Instagram refuses both anonymous reads from your connection (HTTP 401 on the API and a login screen on the page), you can give the bot the `sessionid` cookie of a **spare** Instagram account:
+
+1. In a browser, log in to instagram.com with the spare account.
+2. Press F12, open **Application** (Chrome or Edge) or **Storage** (Firefox), then **Cookies → https://www.instagram.com**.
+3. Copy the **value** of `sessionid`, put it in `.env` as `IG_SESSIONID=...`, and restart the bot.
+4. Don't log that account out in the browser: logging out ends the session. You can simply close the tab.
+
+The startup log confirms "logged-in session configured". From then on, a lookup that both anonymous reads refuse is read as that account, with full data: the numeric ID, verified and private status.
+
+How the cookie is protected and used:
+
+- **Used as a last resort.** It's only used after both anonymous reads are refused, with logged-in reads at least 3 s apart.
+- **Sent to one place only.** It goes only to Instagram's profile API: never to the image servers, and never across a redirect.
+- **Never logged.** It's scrubbed from `logs/bot.log`.
+
+If Instagram rejects the cookie, the bot stops using it for an hour and logs `Instagram rejected the logged-in session … Paste a fresh sessionid`. That happens when the cookie expires, the account is logged out, or Instagram asks the account to verify itself. To fix it, log in again in the browser, copy the new value, and restart.
+
+**Risks:**
+
+- **The account can be lost.** This is automated use of an Instagram account, which goes against Instagram's terms. The account can be challenged, locked or banned. Use one you can afford to lose, never your main account.
+- **The cookie is a password.** Anyone who has it is logged in as that account, so keep `.env` private.
+
 **Not hammering Instagram.** The bot limits its own traffic in three ways:
 
 - **Bot-wide cap.** Every Instagram request goes through one gate: at most 3 at a time, started at least 1 s apart. This covers the monitor, `/bancheck` and `/newjob` together.
@@ -230,6 +252,8 @@ Check `logs/bot.log` first. Repeated problems, such as a missing channel or a fa
 | … no monitor channel set up (/setup) | Run `/setup` in that server. Unban jobs are only checked once it has a monitor channel. |
 | Instagram refused the API (HTTP 401) … Pausing API reads | Instagram wants a login from this connection. The bot falls back to the profile page and resumes the API by itself later. |
 | Read … from the public profile page | The fallback worked. |
+| Read … with the logged-in session | Anonymous reads were refused; the `IG_SESSIONID` account answered. |
+| Instagram rejected the logged-in session | The cookie expired or the account is challenged. Log in again in the browser, copy a fresh `sessionid`, and restart. |
 | … old job(s) have no server recorded | Set `LEGACY_GUILD_ID` in `.env`. |
 
 ## 11. Known limitations

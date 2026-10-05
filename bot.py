@@ -87,6 +87,10 @@ LEGACY_GUILD_ID = os.getenv("LEGACY_GUILD_ID", "").strip()
 # When Instagram's API refuses this connection, read the public profile page
 # instead. Set to false to use the API only.
 instagram.PAGE_FALLBACK = os.getenv("INSTAGRAM_PAGE_FALLBACK", "true").strip().lower() != "false"
+# Optional: the sessionid cookie of a spare Instagram account, used only when
+# Instagram refuses every anonymous read. Treat it like a password.
+IG_SESSIONID_RAW = os.getenv("IG_SESSIONID", "").strip()
+instagram.SESSION_ID = instagram.normalize_session_id(IG_SESSIONID_RAW)
 
 REFRESH_SECONDS = 60          # safety-net redraw
 MAX_ACTIVE_SHOWN = 10         # keep embeds under Discord's 1024-char field cap
@@ -309,6 +313,7 @@ def snapshot_colour(snapshot: instagram.Snapshot) -> int:
 log = logging.getLogger("zm")
 log.setLevel(logging.INFO)
 
+_SESSION_COOKIE = re.compile(r"(sessionid=)[^;\s\"']+", re.IGNORECASE)
 _TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}")
 
 
@@ -318,8 +323,10 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         text = super().format(record)
-        if TOKEN:
-            text = text.replace(TOKEN, "[REDACTED]")
+        for secret in (TOKEN, instagram.SESSION_ID, IG_SESSIONID_RAW):
+            if secret and len(secret) >= 8:
+                text = text.replace(secret, "[REDACTED]")
+        text = _SESSION_COOKIE.sub(r"\1[REDACTED]", text)
         return _TOKEN_SHAPE.sub("[REDACTED]", text)
 
 
@@ -1873,6 +1880,13 @@ def main() -> int:
     if not TOKEN:
         log.error("DISCORD_TOKEN is missing. Put it in a .env file next to bot.py.")
         return 2
+
+    if instagram.SESSION_ID:
+        log.info("Instagram: logged-in session configured; used only when anonymous "
+                 "reads are refused.")
+    elif IG_SESSIONID_RAW:
+        log.error("IG_SESSIONID in .env does not look like an Instagram sessionid cookie; "
+                  "logged-in reads are off. Copy only the cookie's value.")
 
     if not acquire_lock():
         log.error("Another copy of this bot is already running on this machine "

@@ -179,3 +179,14 @@ def test_refresh_button_reports_failure_honestly(env):
 
 async def _make_view():
     return B.DashboardButtons()
+
+
+def test_session_cookie_never_reaches_the_log(monkeypatch):
+    secret = "1234567890%3AAbCdEfGhIjKl%3A12%3AAYsecretsecret"
+    monkeypatch.setattr(B.instagram, "SESSION_ID", secret)
+    formatter = B.RedactingFormatter("%(message)s")
+    for msg in (f"value {secret}", f"Cookie: sessionid={secret}; path=/",
+                "Cookie: sessionid=someOtherValue123456"):
+        record = logging.LogRecord("zm", logging.INFO, __file__, 1, msg, None, None)
+        out = formatter.format(record)
+        assert secret not in out and "someOtherValue123456" not in out

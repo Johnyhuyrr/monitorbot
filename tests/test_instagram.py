@@ -430,3 +430,140 @@ def test_page_avatar_from_unexpected_host_is_ignored(env):
                                         ("987", 987), ("1B", 1_000_000_000), ("abc", None)])
 def test_page_count_formats(text, value):
     assert instagram._count(text) == value
+
+
+# ---------------------------------------------- logged-in session (optional)
+
+SESSION = "1234567890%3AAbCdEfGhIjKl%3A12%3AAYfakefakefake"
+
+
+def refuse_anonymous(env, handle):
+    env.ig.set(handle, (401, {"message": "Please wait a few minutes", "status": "fail"}))
+    env.ig.set_page(handle, (200, b"<html><title>Login</title>Log in to Instagram</html>"))
+
+
+def test_session_used_only_when_both_anonymous_reads_are_refused(env, monkeypatch):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    refuse_anonymous(env, "j00hnyx")
+    env.ig.set_session("j00hnyx", (200, profile("j00hnyx", user_id="4242", verified=True,
+                                                private=True, followers=99)))
+    snap = lookup("j00hnyx")
+    assert snap.state == instagram.OK and snap.source == "session"
+    assert snap.user_id == "4242" and snap.verified and snap.private   # full data
+    assert snap.followers == 99 and snap.avatar == AVATAR
+    assert env.ig.profile_reads == ["j00hnyx"] and env.ig.page_reads == ["j00hnyx"]
+    assert env.ig.session_reads == ["j00hnyx"]
+
+
+def test_session_not_used_when_anonymous_works(env, monkeypatch):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    env.ig.set("fine", (200, profile("fine")))
+    env.ig.set("gone", (404, {}))
+    lookup("fine")
+    lookup("gone")
+    assert env.ig.session_reads == []
+
+
+def test_session_not_used_when_not_configured(env):
+    refuse_anonymous(env, "x.y")
+    env.ig.set_session("x.y", (200, profile("x.y")))
+    assert lookup("x.y").state == instagram.UNKNOWN
+    assert env.ig.session_reads == []
+
+
+def test_cookie_is_never_sent_anywhere_but_the_profile_api(env, monkeypatch):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    refuse_anonymous(env, "x.y")
+    env.ig.set_session("x.y", (200, profile("x.y")))
+    snap = lookup("x.y")
+    assert snap.avatar == AVATAR                         # avatar fetched...
+    assert env.ig.cookies_seen_elsewhere == []           # ...without the cookie
+
+
+def test_session_redirect_is_not_followed(env, monkeypatch, logs):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    refuse_anonymous(env, "x.y")
+    env.ig.set_session("x.y", httpx.Response(
+        302, headers={"Location": "https://evil.example/collect"}))
+    snap = lookup("x.y")
+    assert snap.state == instagram.UNKNOWN
+    assert snap.note == instagram.NOTE_SESSION_INVALID
+    assert env.ig.cookies_seen_elsewhere == []
+
+
+@pytest.mark.parametrize("reply", [
+    (401, {"message": "login_required", "status": "fail"}),
+    (403, {}),
+    (200, {"message": "checkpoint_required", "status": "fail"}),
+    (200, {"message": "challenge_required", "status": "fail"}),
+    (200, b"<html>Log in</html>"),
+])
+def test_rejected_session_is_paused_and_reported_once(env, monkeypatch, logs, reply):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    refuse_anonymous(env, "x.y")
+    env.ig.set_session("x.y", reply)
+    snap = lookup("x.y")
+    assert snap.state == instagram.UNKNOWN and snap.note == instagram.NOTE_SESSION_INVALID
+    assert instagram.cooldown_remaining("session") >= instagram.SESSION_INVALID_PAUSE - 1
+    for _ in range(3):
+        env.clock.advance(120)
+        instagram._cache.clear()
+        lookup("x.y")
+    assert env.ig.session_reads == ["x.y"]                # not hammered with a dead cookie
+    assert sum("rejected the logged-in session" in line for line in logs) == 1
+    assert not any(SESSION in line for line in logs)
+
+
+def test_session_429_is_a_normal_pause(env, monkeypatch):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    refuse_anonymous(env, "x.y")
+    env.ig.set_session("x.y", (429, {}))
+    snap = lookup("x.y")
+    assert snap.state == instagram.UNKNOWN
+    assert 0 < instagram.cooldown_remaining("session") <= instagram.COOLDOWN_BASE_SECONDS
+
+
+@pytest.mark.parametrize("reply", [(404, {}), (200, {"status": "ok", "data": {"user": None}})])
+def test_session_gone(env, monkeypatch, reply):
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    refuse_anonymous(env, "x.y")
+    env.ig.set_session("x.y", reply)
+    assert lookup("x.y").state == instagram.GONE
+
+
+def test_session_reads_are_spaced(env, monkeypatch):
+    import time
+    monkeypatch.setattr(instagram, "SESSION_ID", SESSION)
+    monkeypatch.setattr(instagram, "SESSION_MIN_GAP_SECONDS", 0.05)
+    starts = []
+
+    def handler(request):
+        if "sessionid=" in request.headers.get("cookie", ""):
+            starts.append(time.monotonic())
+            return httpx.Response(200, json=profile(request.url.params["username"], pic=None))
+        if request.url.host == "www.instagram.com" and "web_profile_info" not in request.url.path:
+            return httpx.Response(200, content=b"<html>Log in</html>")
+        return httpx.Response(401, json={})
+
+    monkeypatch.setattr(instagram, "_transport", httpx.MockTransport(handler))
+    monkeypatch.setattr(instagram, "COOLDOWN_BASE_SECONDS", 0)   # keep anonymous tries cheap
+
+    async def burst():
+        await asyncio.gather(*(instagram.lookup(f"s{i}") for i in range(4)))
+    asyncio.run(burst())
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert len(starts) == 4 and all(g >= 0.045 for g in gaps), gaps
+
+
+@pytest.mark.parametrize("raw,clean", [
+    (SESSION, SESSION),
+    (f"sessionid={SESSION}", SESSION),
+    (f'"{SESSION}";', SESSION),
+    (f"  sessionid={SESSION};  ", SESSION),
+    ("", ""),
+    ("abc", ""),                                         # too short
+    (f"{SESSION}\r\nX-Evil: 1", ""),                     # header injection
+    (f"{SESSION}; csrftoken=abc", ""),
+])
+def test_session_value_is_normalised_and_validated(raw, clean):
+    assert instagram.normalize_session_id(raw) == clean
