@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+Zade Meadows - Discord Live Support Monitor
+Hardened build: multi-server, crash-resistant, safe to run 24/7.
+
+Setup in each server (one time, admin only):
+    /setup            -> makes the current channel the live monitor channel
+    /panel            -> posts a control panel anywhere you like
+
+Everyday use (anyone allowed by your Discord permissions):
+    Buttons on the dashboard, plus /newjob, /complete, /stats, /jobs, /ping
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import socket
+import sys
+import time
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Optional
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+# ==========================================================================
+# PATHS  -  always absolute, never depends on the working directory.
+# This alone fixes "my jobs disappeared" when started from Task Scheduler.
+# ==========================================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+LOG_DIR = BASE_DIR / "logs"
+
+DATA_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(exist_ok=True)
+
+JOBS_FILE = DATA_DIR / "jobs.json"
+CONFIG_FILE = DATA_DIR / "config.json"
+LOG_FILE = LOG_DIR / "bot.log"
+
+load_dotenv(BASE_DIR / ".env")
+
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+SYNC_GUILD_ID = os.getenv("SYNC_GUILD_ID", "").strip()
+LOCK_PORT = int(os.getenv("LOCK_PORT", "49221"))
+BRAND = os.getenv("BRAND_NAME", "Zade Meadows")
+
+REFRESH_SECONDS = 60          # safety-net redraw
+MAX_ACTIVE_SHOWN = 10         # keep embeds under Discord's 1024-char field cap
+EMBED_FIELD_LIMIT = 1000
+
+# ==========================================================================
+# LOGGING  -  UTF-8 everywhere. Windows consoles are cp1252 by default and
+# printing an emoji there raises UnicodeEncodeError, which can kill the bot.
+# ==========================================================================
+
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+log = logging.getLogger("zm")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%Y-%m-%d %H:%M:%S")
+
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+_file_handler.setFormatter(_fmt)
+log.addHandler(_file_handler)
+
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(_fmt)
+log.addHandler(_console)
+
+logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("discord").addHandler(_file_handler)
+
+
+# ==========================================================================
+# STORAGE  -  atomic writes + automatic backup.
+# A normal open(..., "w") truncates the file first. If the process dies in
+# that window (PC sleeps, power cut, Ctrl-C) you are left with a half-written
+# or empty jobs.json, which is why the data kept needing manual repair.
+# ==========================================================================
+
+def _read_json(path: Path, default: Any) -> Any:
+    for candidate in (path, path.with_suffix(path.suffix + ".bak")):
+        if not candidate.exists():
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if candidate != path:
+                log.warning("%s was unreadable; recovered from backup.", path.name)
+            return data
+        except Exception as exc:
+            log.error("Could not read %s (%s: %s)", candidate.name, type(exc).__name__, exc)
+
+    if path.exists():
+        quarantine = path.with_name(f"{path.stem}.corrupt-{int(time.time())}{path.suffix}")
+        try:
+            path.rename(quarantine)
+            log.error("Moved damaged file to %s - starting fresh.", quarantine.name)
+        except Exception:
+            pass
+    return default
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    """Write to a temp file, flush to disk, then swap it in. Never truncates
+    the live file, so a crash mid-write cannot destroy your data."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    backup = path.with_suffix(path.suffix + ".bak")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists():
+            try:
+                backup.unlink(missing_ok=True)
+                path.replace(backup)
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    except Exception as exc:
+        log.exception("Failed to save %s: %s", path.name, exc)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def migrate_legacy_jobs() -> None:
+    """Import an old jobs.json that sat next to bot.py, once."""
+    legacy = BASE_DIR / "jobs.json"
+    if legacy.exists() and not JOBS_FILE.exists():
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                _write_json(JOBS_FILE, data)
+                log.info("Imported %d job(s) from the old jobs.json.", len(data))
+        except Exception as exc:
+            log.error("Could not import old jobs.json: %s", exc)
+
+
+migrate_legacy_jobs()
+
+jobs: list[dict] = [j for j in _read_json(JOBS_FILE, []) if isinstance(j, dict)]
+config: dict = _read_json(CONFIG_FILE, {}) or {}
+
+
+def save_jobs() -> None:
+    _write_json(JOBS_FILE, jobs)
+
+
+def save_config() -> None:
+    _write_json(CONFIG_FILE, config)
+
+
+def guild_config(guild_id: int) -> dict:
+    return config.setdefault(str(guild_id), {})
+
+
+# ==========================================================================
+# HELPERS
+# ==========================================================================
+
+def guild_jobs(guild_id: int) -> list[dict]:
+    """Jobs belonging to one server. Legacy jobs have no guild_id, so they are
+    adopted by the first server that loads them."""
+    gid = str(guild_id)
+    return [j for j in jobs if str(j.get("guild_id", gid)) == gid]
+
+
+def next_job_id(guild_id: int) -> str:
+    numbers = []
+    for job in guild_jobs(guild_id):
+        try:
+            numbers.append(int(str(job.get("id", "")).split("-")[-1]))
+        except (ValueError, IndexError):
+            continue
+    return f"ZM-{max(numbers, default=0) + 1:04d}"
+
+
+def find_job(guild_id: int, job_id: str) -> Optional[dict]:
+    job_id = job_id.strip().upper()
+    if job_id and not job_id.startswith("ZM-") and job_id.isdigit():
+        job_id = f"ZM-{int(job_id):04d}"
+    return next((j for j in guild_jobs(guild_id) if str(j.get("id", "")).upper() == job_id), None)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def parse_time(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+# ==========================================================================
+# DASHBOARD EMBED
+# ==========================================================================
+
+def build_dashboard(guild_id: int, bot_user: Optional[discord.abc.User]) -> discord.Embed:
+    records = guild_jobs(guild_id)
+    active = [j for j in records if j.get("status") == "active"]
+    completed = [j for j in records if j.get("status") == "completed"]
+
+    today = datetime.now(timezone.utc).date()
+    completed_today = sum(
+        1 for j in completed
+        if (t := parse_time(j.get("completed"))) and t.date() == today
+    )
+
+    durations = [j["duration_seconds"] for j in completed if j.get("duration_seconds")]
+    average = format_duration(sum(durations) / len(durations)) if durations else "-"
+
+    embed = discord.Embed(
+        title=f"📡  {BRAND.upper()}",
+        description="**LIVE SUPPORT MONITOR**\n━━━━━━━━━━━━━━━━━━━━━━━━",
+        colour=discord.Colour.dark_grey(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if bot_user:
+        embed.set_thumbnail(url=bot_user.display_avatar.url)
+
+    if active:
+        lines, shown = [], 0
+        for job in active[:MAX_ACTIVE_SHOWN]:
+            started = parse_time(job.get("started"))
+            when = f"⏱ <t:{int(started.timestamp())}:R>\n" if started else ""
+            block = (
+                f"🟡 **{job.get('id', '????')}**\n"
+                f"👤 `@{job.get('username', 'unknown')}`\n"
+                f"🛠 `{job.get('service', 'unknown')}`\n"
+                f"{when}\n"
+            )
+            # Hard stop before Discord's 1024-character field limit. Going over
+            # it made the old dashboard silently stop updating forever.
+            if sum(len(x) for x in lines) + len(block) > EMBED_FIELD_LIMIT:
+                break
+            lines.append(block)
+            shown += 1
+        if len(active) > shown:
+            lines.append(f"…and {len(active) - shown} more active job(s).")
+        embed.add_field(name=f"🟡 ACTIVE JOBS • {len(active)}", value="".join(lines), inline=False)
+    else:
+        embed.add_field(name="🟡 ACTIVE JOBS • 0", value="No active jobs right now.", inline=False)
+
+    embed.add_field(name="🟢 COMPLETED", value=f"`{len(completed)}`", inline=True)
+    embed.add_field(name="📅 TODAY", value=f"`{completed_today}`", inline=True)
+    embed.add_field(name="📋 TOTAL", value=f"`{len(records)}`", inline=True)
+    embed.add_field(name="⏱ AVG TIME", value=f"`{average}`", inline=True)
+    embed.set_footer(text=f"{BRAND} • Live Monitor")
+    return embed
+
+
+def dashboard_signature(guild_id: int) -> str:
+    """Only redraw when something actually changed - saves rate limit budget.
+    Relative timestamps update by themselves on the user's client."""
+    records = guild_jobs(guild_id)
+    return json.dumps(
+        [(j.get("id"), j.get("status"), j.get("completed")) for j in records],
+        sort_keys=True,
+    )
+
+
+# ==========================================================================
+# BOT
+# ==========================================================================
+
+intents = discord.Intents.default()
+# message_content is a PRIVILEGED intent. Leave it off unless you have ticked
+# it in the Developer Portal, otherwise login fails outright.
+if os.getenv("ENABLE_MESSAGE_CONTENT", "false").lower() == "true":
+    intents.message_content = True
+
+
+class MonitorBot(commands.Bot):
+    def __init__(self) -> None:
+        super().__init__(command_prefix="!", intents=intents, help_command=None)
+        self.signatures: dict[int, str] = {}
+
+    async def setup_hook(self) -> None:
+        # Registering the view here means buttons keep working after a restart.
+        self.add_view(DashboardButtons())
+
+        # The old script defined a slash command but never synced the tree,
+        # so /complete never actually appeared in Discord.
+        try:
+            if SYNC_GUILD_ID:
+                guild = discord.Object(id=int(SYNC_GUILD_ID))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                log.info("Slash commands synced instantly to guild %s.", SYNC_GUILD_ID)
+            else:
+                await self.tree.sync()
+                log.info("Slash commands synced globally (can take up to 1 hour).")
+        except Exception as exc:
+            log.error("Slash command sync failed: %s: %s", type(exc).__name__, exc)
+
+        dashboard_loop.start()
+
+
+bot = MonitorBot()
+
+
+async def update_dashboard(guild_id: int, force: bool = False) -> None:
+    """Edit the pinned dashboard for one server, creating it if needed."""
+    settings = config.get(str(guild_id))
+    if not settings or not settings.get("monitor_channel_id"):
+        return
+
+    signature = dashboard_signature(guild_id)
+    if not force and bot.signatures.get(guild_id) == signature:
+        return
+
+    channel = bot.get_channel(int(settings["monitor_channel_id"]))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(settings["monitor_channel_id"]))
+        except (discord.NotFound, discord.Forbidden):
+            log.warning("Monitor channel for guild %s is gone or not visible.", guild_id)
+            return
+        except discord.HTTPException:
+            return
+
+    embed = build_dashboard(guild_id, bot.user)
+    view = DashboardButtons()
+    message_id = settings.get("dashboard_message_id")
+
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=embed, view=view)
+            bot.signatures[guild_id] = signature
+            return
+        except discord.NotFound:
+            settings.pop("dashboard_message_id", None)
+        except discord.Forbidden:
+            log.warning("Missing permission to edit the dashboard in guild %s.", guild_id)
+            return
+        except discord.HTTPException as exc:
+            log.warning("Dashboard edit failed in guild %s: %s", guild_id, exc)
+            return
+
+    try:
+        message = await channel.send(embed=embed, view=view)
+        settings["dashboard_message_id"] = message.id
+        save_config()
+        bot.signatures[guild_id] = signature
+    except discord.Forbidden:
+        log.warning("Missing permission to post the dashboard in guild %s.", guild_id)
+    except discord.HTTPException as exc:
+        log.warning("Could not post dashboard in guild %s: %s", guild_id, exc)
+
+
+@tasks.loop(seconds=REFRESH_SECONDS)
+async def dashboard_loop() -> None:
+    for guild_id in list(config.keys()):
+        try:
+            await update_dashboard(int(guild_id))
+        except Exception as exc:
+            # One bad server must never take the whole loop down.
+            log.exception("Dashboard refresh failed for guild %s: %s", guild_id, exc)
+
+
+@dashboard_loop.before_loop
+async def before_dashboard_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@dashboard_loop.error
+async def dashboard_loop_error(exc: BaseException) -> None:
+    """Without this, ONE unhandled error stops the loop permanently and
+    silently - the bot looks alive but the dashboard freezes."""
+    log.exception("Dashboard loop crashed, restarting it: %s", exc)
+    dashboard_loop.restart()
+
+
+# ==========================================================================
+# JOB ACTIONS
+# ==========================================================================
+
+async def create_job(interaction: discord.Interaction, username: str, service: str) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Use this inside a server.", ephemeral=True)
+        return
+
+    username = username.strip().lstrip("@")[:100]
+    if not username:
+        await interaction.response.send_message("❌ Please enter a username.", ephemeral=True)
+        return
+
+    job = {
+        "id": next_job_id(interaction.guild_id),
+        "guild_id": str(interaction.guild_id),
+        "username": username,
+        "service": service,
+        "started": datetime.now(timezone.utc).isoformat(),
+        "status": "active",
+        "opened_by": str(interaction.user.id),
+    }
+    jobs.append(job)
+    save_jobs()
+
+    # Answer Discord first. Anything slower than 3 seconds shows the dreaded
+    # "This interaction failed" message.
+    await interaction.response.send_message(
+        f"🔵 **{job['id']}** started\n👤 `@{username}`\n🛠 `{service}`",
+        ephemeral=True,
+    )
+    log.info("Job %s opened in guild %s by %s", job["id"], interaction.guild_id, interaction.user)
+    await update_dashboard(interaction.guild_id)
+
+
+async def complete_job(interaction: discord.Interaction, raw_id: str) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Use this inside a server.", ephemeral=True)
+        return
+
+    job = find_job(interaction.guild_id, raw_id)
+    if job is None:
+        await interaction.response.send_message(
+            f"❌ Job `{raw_id.strip().upper()}` was not found in this server.", ephemeral=True
+        )
+        return
+
+    if job.get("status") != "active":
+        await interaction.response.send_message(
+            f"⚠️ `{job['id']}` is already completed.", ephemeral=True
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    started = parse_time(job.get("started")) or now
+    duration = max((now - started).total_seconds(), 0)
+
+    job["status"] = "completed"
+    job["completed"] = now.isoformat()
+    job["duration_seconds"] = int(duration)
+    job["closed_by"] = str(interaction.user.id)
+    job.setdefault("guild_id", str(interaction.guild_id))
+    save_jobs()
+
+    await interaction.response.send_message(
+        f"🟢 **{job['id']} COMPLETED**\n"
+        f"👤 `@{job.get('username', 'unknown')}`\n"
+        f"🛠 `{job.get('service', 'unknown')}`\n"
+        f"⏱ Time taken: `{format_duration(duration)}`",
+        ephemeral=True,
+    )
+    log.info("Job %s completed in guild %s by %s", job["id"], interaction.guild_id, interaction.user)
+    await update_dashboard(interaction.guild_id)
+
+
+# ==========================================================================
+# MODALS
+# ==========================================================================
+
+class UsernameModal(discord.ui.Modal):
+    def __init__(self, service: str) -> None:
+        super().__init__(title=f"{service} - New Job"[:45])
+        self.service = service
+        self.username = discord.ui.TextInput(
+            label="Instagram username", placeholder="example_username",
+            required=True, max_length=100,
+        )
+        self.add_item(self.username)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await create_job(interaction, self.username.value, self.service)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("New-job modal error: %s", error)
+        await safe_error_reply(interaction)
+
+
+class CompleteModal(discord.ui.Modal, title="Complete Job"):
+    job_id = discord.ui.TextInput(label="Job ID", placeholder="ZM-0001", required=True, max_length=20)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await complete_job(interaction, self.job_id.value)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Complete-job modal error: %s", error)
+        await safe_error_reply(interaction)
+
+
+async def safe_error_reply(interaction: discord.Interaction) -> None:
+    message = "⚠️ Something went wrong, but the bot is still running. Please try again."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+# ==========================================================================
+# BUTTONS  -  custom_id + timeout=None makes them survive restarts.
+# ==========================================================================
+
+class DashboardButtons(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Verification", emoji="🔵",
+                       style=discord.ButtonStyle.primary, custom_id="zm_verification")
+    async def verification_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(UsernameModal("Instagram Verification"))
+
+    @discord.ui.button(label="Account Support", emoji="🟢",
+                       style=discord.ButtonStyle.success, custom_id="zm_account_support")
+    async def support_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(UsernameModal("Account Support"))
+
+    @discord.ui.button(label="Complete Job", emoji="✅",
+                       style=discord.ButtonStyle.secondary, custom_id="zm_complete_job")
+    async def complete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CompleteModal())
+
+    @discord.ui.button(label="Refresh", emoji="🔄",
+                       style=discord.ButtonStyle.secondary, custom_id="zm_refresh")
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if interaction.guild_id:
+                await update_dashboard(interaction.guild_id, force=True)
+            await interaction.followup.send("🔄 Dashboard refreshed.", ephemeral=True)
+        except Exception as exc:
+            log.exception("Refresh failed: %s", exc)
+            await safe_error_reply(interaction)
+
+    async def on_error(self, interaction: discord.Interaction,
+                       error: Exception, item: discord.ui.Item) -> None:
+        log.exception("Button error on %s: %s", item, error)
+        await safe_error_reply(interaction)
+
+
+# ==========================================================================
+# SLASH COMMANDS
+# ==========================================================================
+
+@bot.tree.command(name="setup", description="Make this channel the live monitor channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setup_command(interaction: discord.Interaction) -> None:
+    settings = guild_config(interaction.guild_id)
+    settings["monitor_channel_id"] = interaction.channel_id
+    settings.pop("dashboard_message_id", None)
+    save_config()
+    bot.signatures.pop(interaction.guild_id, None)
+
+    await interaction.response.send_message(
+        "✅ This channel is now the live monitor. The dashboard will appear in a moment "
+        "and update itself automatically.",
+        ephemeral=True,
+    )
+    await update_dashboard(interaction.guild_id, force=True)
+
+
+@bot.tree.command(name="panel", description="Post the control panel in this channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def panel_command(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title=f"📡  {BRAND.upper()}",
+        description="**LIVE SUPPORT MONITOR**\n\nUse the buttons below to manage support records.",
+        colour=discord.Colour.dark_grey(),
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="🔵 VERIFICATION", value="Start a new verification job.", inline=False)
+    embed.add_field(name="🟢 ACCOUNT SUPPORT", value="Start a new account-support job.", inline=False)
+    embed.add_field(name="✅ COMPLETE", value="Close an active job using its Job ID.", inline=False)
+    embed.set_footer(text=f"{BRAND} • Monitor System")
+    await interaction.response.send_message(embed=embed, view=DashboardButtons())
+
+
+@bot.tree.command(name="newjob", description="Open a new job")
+@app_commands.describe(username="Instagram username", service="Type of service")
+@app_commands.choices(service=[
+    app_commands.Choice(name="Instagram Verification", value="Instagram Verification"),
+    app_commands.Choice(name="Account Support", value="Account Support"),
+])
+async def newjob_command(interaction: discord.Interaction, username: str,
+                         service: app_commands.Choice[str]) -> None:
+    await create_job(interaction, username, service.value)
+
+
+@bot.tree.command(name="complete", description="Mark an active job as completed")
+@app_commands.describe(job_id="The Job ID, for example ZM-0001")
+async def complete_command(interaction: discord.Interaction, job_id: str) -> None:
+    await complete_job(interaction, job_id)
+
+
+@bot.tree.command(name="jobs", description="List the active jobs in this server")
+async def jobs_command(interaction: discord.Interaction) -> None:
+    active = [j for j in guild_jobs(interaction.guild_id) if j.get("status") == "active"]
+    if not active:
+        await interaction.response.send_message("No active jobs right now.", ephemeral=True)
+        return
+    lines = [
+        f"🟡 `{j.get('id')}` • `@{j.get('username')}` • {j.get('service')}"
+        for j in active[:25]
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="stats", description="Show job statistics for this server")
+async def stats_command(interaction: discord.Interaction) -> None:
+    records = guild_jobs(interaction.guild_id)
+    embed = discord.Embed(
+        title=f"📊 {BRAND.upper()}", description="**JOB STATISTICS**",
+        colour=discord.Colour.dark_grey(),
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="📋 TOTAL", value=f"`{len(records)}`", inline=True)
+    embed.add_field(name="🟡 ACTIVE",
+                    value=f"`{sum(1 for j in records if j.get('status') == 'active')}`", inline=True)
+    embed.add_field(name="🟢 COMPLETED",
+                    value=f"`{sum(1 for j in records if j.get('status') == 'completed')}`", inline=True)
+    embed.set_footer(text=f"{BRAND} • Statistics")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="ping", description="Check that the bot is alive")
+async def ping_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"🏓 Pong! Latency `{round(bot.latency * 1000)}ms`", ephemeral=True
+    )
+
+
+@bot.tree.error
+async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        await safe_reply(interaction, "🚫 You need the **Manage Server** permission for that.")
+        return
+    log.exception("Slash command error: %s", error)
+    await safe_error_reply(interaction)
+
+
+async def safe_reply(interaction: discord.Interaction, message: str) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+# ==========================================================================
+# LIFECYCLE
+# ==========================================================================
+
+@bot.event
+async def on_ready() -> None:
+    log.info("Online as %s in %d server(s).", bot.user, len(bot.guilds))
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching, name="support jobs"
+    ))
+    for guild in bot.guilds:
+        await update_dashboard(guild.id, force=True)
+
+
+@bot.event
+async def on_resumed() -> None:
+    log.info("Reconnected to Discord.")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    log.info("Added to a new server: %s (%s)", guild.name, guild.id)
+
+
+# ==========================================================================
+# SINGLE INSTANCE GUARD
+# Two copies of the bot fighting over jobs.json is a classic cause of
+# duplicate dashboards and lost records.
+# ==========================================================================
+
+_lock_socket: Optional[socket.socket] = None
+
+
+def acquire_lock() -> bool:
+    global _lock_socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", LOCK_PORT))
+        sock.listen(1)
+        _lock_socket = sock
+        return True
+    except OSError:
+        sock.close()
+        return False
+
+
+def main() -> int:
+    if not TOKEN:
+        log.error("DISCORD_TOKEN is missing. Put it in a .env file next to bot.py.")
+        return 2
+
+    if not acquire_lock():
+        log.error("Another copy of this bot is already running on this machine. Exiting.")
+        return 3
+
+    try:
+        bot.run(TOKEN, log_handler=None, reconnect=True)
+    except discord.LoginFailure:
+        log.error(
+            "Discord rejected the token. It was most likely reset because it leaked. "
+            "Generate a new one in the Developer Portal and update your .env file."
+        )
+        return 4
+    except discord.PrivilegedIntentsRequired:
+        log.error(
+            "A privileged intent is not enabled. Either tick MESSAGE CONTENT INTENT in the "
+            "Developer Portal, or set ENABLE_MESSAGE_CONTENT=false in your .env."
+        )
+        return 5
+    except KeyboardInterrupt:
+        log.info("Stopped by user.")
+        return 0
+    except Exception as exc:
+        log.exception("Unhandled crash: %s: %s", type(exc).__name__, exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,108 @@
+--- /mnt/user-data/outputs/bot.py	2026-09-22 04:55:41.261774000 +0000
++++ proj/files/files/bot.py	2026-09-22 05:00:07.236722580 +0000
+@@ -616,17 +616,21 @@
+ 
+ 
+ async def send_completion_message(guild_id: Any, embed: discord.Embed,
+-                                  files: list[discord.File]) -> None:
++                                  files: list[discord.File]) -> bool:
+     """Post a completion card with no interaction to reply to - the monitor
+     has none. /complete keeps replying to its interaction as before; this is
+     only for completions the monitor finds by itself. The only channel this
+     bot remembers for a server is the one /setup made the live monitor, so an
+-    automatic completion is posted there, alongside the dashboard."""
++    automatic completion is posted there, alongside the dashboard.
++
++    Returns whether the card actually reached Discord. The caller uses this
++    to decide whether the job is really finished - a completion nobody was
++    ever shown must not be recorded as one."""
+     settings = config.get(str(guild_id))
+     if not settings or not settings.get("monitor_channel_id"):
+         log.warning("Guild %s has no monitor channel set up (/setup); "
+                     "automatic completion was not posted anywhere.", guild_id)
+-        return
++        return False
+ 
+     channel = bot.get_channel(int(settings["monitor_channel_id"]))
+     if channel is None:
+@@ -635,22 +639,43 @@
+         except (discord.NotFound, discord.Forbidden):
+             log.warning("Monitor channel for guild %s is gone or not visible; "
+                        "could not post automatic completion.", guild_id)
+-            return
++            return False
+         except discord.HTTPException:
+-            return
++            return False
+ 
+     try:
+         await channel.send(embed=embed, files=files)
++        return True
+     except discord.Forbidden:
+         log.warning("Missing permission to post an automatic completion in guild %s.", guild_id)
++        return False
+     except discord.HTTPException as exc:
+         log.warning("Could not post automatic completion in guild %s: %s", guild_id, exc)
++        return False
+ 
+ 
+ async def auto_complete_job(job: dict, snapshot: instagram.Snapshot) -> None:
+     """Close one job using a snapshot the monitor already confirmed is OK.
+     Guarded the same way /complete is guarded, so a job can never be
+-    finished twice no matter which of the two triggers it."""
++    finished twice no matter which of the two triggers it.
++
++    The card is built and delivered BEFORE anything is written to jobs.json.
++    Either can fail - Pillow can choke on a corrupt avatar, Discord can be
++    down, the channel can be gone - and none of those failures may leave a
++    job permanently marked completed with no card ever shown for it: there is
++    no /reopen command, so that state could only be fixed by hand. Leaving
++    the job active instead costs at most a few extra checks: _completing is
++    released in the `finally` below either way, so the very next monitor
++    tick simply tries the whole thing again once whatever failed recovers.
++
++    The opposite ordering - save "completed" first, notify after - was
++    rejected: it fails the same way in the more common case (a rendering or
++    Discord error) while only avoiding a much rarer one (the process being
++    killed in the instant between a successful send and the save that
++    follows it here). That narrow case can, at worst, repeat one already-
++    delivered notification once the job is retried - a harmless duplicate,
++    and a far smaller problem than a job stuck "completed" forever with
++    nothing ever posted for it."""
+     guild_id = job.get("guild_id")
+     key = (str(guild_id), str(job.get("id")))
+     if key in _completing:
+@@ -665,6 +690,22 @@
+         duration = max((now - started).total_seconds(), 0)
+         username = str(job.get("username", "unknown"))
+ 
++        try:
++            snapshot, files = await build_frame(username, snapshot)
++        except Exception as exc:
++            log.exception("Job %s: could not build the completion card (%s). "
++                          "Left active - will retry on the next check.", job.get("id"), exc)
++            return
++
++        embed = completion_embed(job, username, duration, snapshot, bool(files))
++        delivered = await send_completion_message(guild_id, embed, files)
++        if not delivered:
++            log.error("Job %s: the completion card could not be delivered. "
++                      "Left active - will retry once the channel or Discord recovers.",
++                      job.get("id"))
++            return
++
++        # Only now, with the card actually shown, is the job recorded as done.
+         job["status"] = "completed"
+         job["completed"] = now.isoformat()
+         job["duration_seconds"] = int(duration)
+@@ -674,10 +715,6 @@
+         job.setdefault("guild_id", str(guild_id))
+         save_jobs()
+ 
+-        snapshot, files = await build_frame(username, snapshot)
+-        embed = completion_embed(job, username, duration, snapshot, bool(files))
+-        await send_completion_message(guild_id, embed, files)
+-
+         log.info("Job %s automatically completed in guild %s - Instagram now reachable.",
+                  job["id"], guild_id)
+         await update_dashboard(int(guild_id))
