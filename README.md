@@ -56,6 +56,8 @@ On Windows you can double-click `start_bot.bat`. It restarts the bot automatical
 
 None of the tests touch Discord, Instagram, or your real `data/` and `logs/` folders.
 
+GitHub Actions (`.github/workflows/tests.yml`) runs the same `pytest` on every pull request and every push to `main`. It tests Python 3.10–3.13 on Linux, plus Python 3.12 on Windows.
+
 ## 4. Invite the bot
 
 In the Developer Portal, go to **OAuth2 → URL Generator** and choose:
