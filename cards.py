@@ -74,7 +74,17 @@ def _font(candidates: Iterable[str], size: int):
             return ImageFont.truetype(path, size)
         except Exception:
             continue
-    return ImageFont.load_default()
+    # No system font found. Pillow >= 10.1 ships a scalable default; older
+    # versions only have a tiny bitmap font, which has no .size and cannot
+    # anchor text - _size() and _centred_text() below cope with both.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _size(font, fallback: int = 11) -> int:
+    return int(getattr(font, "size", fallback))
 
 
 def bold(size: int):
@@ -126,7 +136,10 @@ def _avatar(avatar_bytes: Optional[bytes], size: int) -> "Image.Image":
     else:
         draw = ImageDraw.Draw(canvas)
         glyph = bold(int(size * 0.42))
-        draw.text((size / 2, size / 2), "?", font=glyph, fill=(70, 77, 84), anchor="mm")
+        try:
+            draw.text((size / 2, size / 2), "?", font=glyph, fill=(70, 77, 84), anchor="mm")
+        except ValueError:  # bitmap fallback font: no anchors
+            draw.text((size / 2, size / 2), "?", font=glyph, fill=(70, 77, 84))
 
     rounded = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     rounded.paste(canvas, (0, 0), _circle_mask(size))
@@ -167,7 +180,7 @@ def _pill(draw: "ImageDraw.ImageDraw", x: int, y: int, label: str,
     """Small outlined tag. Returns the x where the next pill can start."""
     pad_x, pad_y = 16, 9
     width = int(draw.textlength(label, font=font))
-    height = font.size + pad_y * 2
+    height = _size(font) + pad_y * 2
     box = (x, y, x + width + pad_x * 2, y + height)
     draw.rounded_rectangle(box, radius=height // 2, fill=(colour[0] // 7 + 14,
                                                           colour[1] // 7 + 15,
@@ -249,7 +262,7 @@ def render_profile_card(
     draw.text((text_x, 84), handle, font=handle_font, fill=TEXT)
     if verified:
         tick_x = text_x + int(draw.textlength(handle, font=handle_font)) + 26
-        _verified_badge(card, tick_x, 84 + handle_font.size // 2 + 2, 18)
+        _verified_badge(card, tick_x, 84 + _size(handle_font, 46) // 2 + 2, 18)
 
     # display name
     if full_name:
