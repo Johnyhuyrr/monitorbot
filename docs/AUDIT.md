@@ -160,3 +160,35 @@ The work goes in priority order. Each step is a small change with tests.
    - keep both suites, adjusting only where the behaviour intentionally changed and saying so in the test
    - add a pytest suite against real discord.py and `httpx.MockTransport`
    - pytest also runs the two legacy scripts
+
+## 9. Resolution
+
+| # | Fix | Proven by |
+|---|---|---|
+| 1 | `_parse` returns GONE only for an explicit `data.user: null`. Throttle and login JSON, malformed bodies, and replies about another username are UNKNOWN. | `test_instagram.py::test_please_wait_json_*`, `test_malformed_json_*` |
+| 2 | `different_account()`: a different numeric ID is never auto-completed. The dashboard shows it, and a manual close carries a note. | `test_jobs.py::test_handle_taken_over_*`, monitor TEST 13 |
+| 3 | `apply_completion` stores `ig_user_id` from the confirming read. | `test_auto_completion_posts_then_saves`, monitor TEST 14 |
+| 4 | `guild_jobs` matches the guild exactly. Orphans are adopted only via `LEGACY_GUILD_ID` or a single configured guild. | `test_dashboard.py::test_legacy_jobs_*`, `test_guild_a_*` |
+| 5 | Per-guild dashboard lock. `/setup` reuses the dashboard in the same channel and deletes the old one when the channel changes. | `test_concurrent_updates_never_create_duplicate_dashboards` (mutation-verified), `test_setup_*` |
+| 6 | Manual completion holds the guard until the save. It renders first and re-checks the status, and a failed save reverts the job. | `test_manual_complete_*`, `test_manual_and_auto_completion_race_completes_once` |
+| 7 | `storage.write_json` raises `PersistenceError`. `save_jobs()` returns a bool and failed saves are retried by the dashboard loop. | `test_bot_save_failure_is_reported_and_retried` |
+| 8 | The primary is copied (not moved) to `.bak`. A damaged primary is quarantined, and a wrong-typed file falls back to `.bak`. | `test_storage.py` (interrupted write, damaged primary, both damaged) |
+| 9 | `normalize_handle` validates handles (it also accepts profile links). The handle is URL-quoted. | `test_invalid_handle_never_reaches_instagram`, `test_invalid_username_is_rejected_*` |
+| 10 | Bot-wide gate of 3 concurrent requests spaced 1 s apart. Cooldown runs 30 s → 15 min and honours `Retry-After`. `/bancheck` has a slash-command cooldown. | `test_concurrency_is_bounded`, `test_requests_are_spaced`, `test_429_*`, monitor TEST 12 |
+| 11 | The cache is skipped when the caller wants an avatar the cached read lacks. GONE is cached 30 s (less than the monitor interval). | `test_cache_without_picture_*`, `test_gone_is_cached_only_briefly` |
+| 12 | `httpx.TimeoutException` is reported as a timeout. | `test_timeout_is_unknown_and_says_timeout` |
+| 13 | Loop bodies never raise. `gather(return_exceptions=True)`. Error handlers schedule a restart after the task ends, and each loop watches the other. | `test_loop_bodies_swallow_errors`, `test_a_crashed_loop_is_started_again` |
+| 14 | `guild_only` on every command except `/ping`. `default_permissions(manage_guild)` on `/setup` and `/panel`. | `test_command_set_is_preserved`, `test_commands_refuse_dms` |
+| 15 | No I/O at import. `setup_logging()` and `load_state()` run from `main()`. `ZM_DATA_DIR` and `ZM_LOG_DIR` overrides. | `test_importing_the_bot_writes_nothing`, `test_paths_*` |
+| 16 | The card and the first logo render run via `asyncio.to_thread`. | |
+| 17 | The font fallback uses `load_default(size=)` and copes with bitmap fonts. | |
+| 18 | `LegacyButtons` answers `zm_account_support`. | `test_panel_buttons_are_persistent_with_stable_ids` |
+| 19 | `Intents.none() + guilds`. `when_mentioned` prefix, so there is no warning. | `test_only_the_guilds_intent_is_requested` |
+| 20 | SIGTERM triggers `bot.close()`. "Shut down." is logged. A data-folder file lock sits beside the port lock. | `test_second_instance_exits_cleanly`, `test_port_lock_*`, `test_data_lock_*` |
+
+Two further problems were found while testing:
+
+- **Missing "Attach Files" permission.** The README omitted it, so every automatic completion failed forever. Posts now fall back to a text-only embed.
+- **Cards that fail the same way every time.** Such a card was retried forever. It is now posted without the image after 2 attempts.
+
+Mutation check: each guard above was reverted in a scratch copy, and the pytest suite failed for all of them. The exceptions are two belt-and-braces duplicates, which can't be caught without a different guard firing first.
