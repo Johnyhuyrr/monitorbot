@@ -50,6 +50,13 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="zm-monitortest-"))
     B.JOBS_FILE = tmp / "jobs.json"
 
+    # Time is simulated: each tick() moves this clock forward by one monitor
+    # interval, which is what really separates two ticks. instagram.py uses
+    # it for its cache and for the rate-limit pause it takes after a 429.
+    clock = {"now": 1_000.0}
+    instagram._clock = lambda: clock["now"]
+    instagram.MIN_GAP_SECONDS = 0  # no real waiting between scripted reads
+
     AVATAR = S.sample_avatar((60, 140, 200))
     script: dict[str, list] = {}   # script[handle] = [(status, body), ...]; last repeats
     reads: list[str] = []
@@ -145,6 +152,7 @@ def main() -> int:
         script.clear(); reads.clear(); cards_drawn.clear(); log_lines.clear()
         channel_sends.clear(); dashboards.clear()
         instagram._cache.clear(); B._completing.clear()
+        instagram.reset_rate_limit(); B.monitor_status.clear(); B._card_failures.clear()
         instagram.HTTPX_AVAILABLE = True
         B.jobs.clear(); B.config.clear(); channels.clear()
         B.save_jobs()
@@ -153,7 +161,8 @@ def main() -> int:
         return json.loads(B.JOBS_FILE.read_text())
 
     async def tick():
-        """One monitor pass over every active Unban job, right now."""
+        """One monitor pass over every active Unban job, one interval later."""
+        clock["now"] += B.MONITOR_INTERVAL_SECONDS
         await B.monitor_loop()
 
     # ==================================================================
@@ -203,9 +212,19 @@ def main() -> int:
     check("no completion message was ever sent", channel_sends == [])
     check("monitor is still willing to check again later (no crash, no give-up state)",
           B.jobs[0].get("status") == "active")
+    check("backs off while throttled: fewer Instagram reads than ticks",
+          reads.count("beta") < 5, reads.count("beta"))
+    # Changed with the rate-limit pause: after repeated 429s the monitor waits
+    # out Instagram's pause instead of reading again on the very next tick.
     script["beta"] = [(200, profile("beta", 10, 1, 1))]
-    asyncio.run(tick())
-    check("completes as soon as a real answer arrives", B.jobs[0]["status"] == "completed")
+    for _ in range(20):
+        asyncio.run(tick())
+        if B.jobs[0]["status"] == "completed":
+            break
+    check("completes once the pause ends and a real answer arrives",
+          B.jobs[0]["status"] == "completed")
+    check("the pause is bounded (never more than COOLDOWN_MAX_SECONDS)",
+          instagram.cooldown_remaining() <= instagram.COOLDOWN_MAX_SECONDS)
 
     # ==================================================================
     section("TEST 3  ·  GONE must never be read as a successful unban")
@@ -249,9 +268,12 @@ def main() -> int:
     B.jobs.append(new_active_job("ZM-1006", "quick"))
     B.jobs.append(new_active_job("ZM-1007", "mixed"))
     B.save_jobs()
-    script["slow"] = [(429, {})]
+    # "Not yet" is a 503 here, not a 429: a 429 pauses every read bot-wide
+    # (Instagram limits per IP, so the other reads would be refused too) -
+    # that is TEST 12. This test is about jobs not waiting on each other.
+    script["slow"] = [(503, {})]
     script["quick"] = [(200, profile("quick", 1, 1, 1))]
-    script["mixed"] = [(429, {}), (200, profile("mixed", 2, 2, 2))]
+    script["mixed"] = [(503, {}), (200, profile("mixed", 2, 2, 2))]
 
     asyncio.run(tick())
     by_id = {j["id"]: j for j in B.jobs}
@@ -484,6 +506,64 @@ def main() -> int:
     check("the card was rebuilt for the retry (cheap, local, no extra Instagram call) "
           "but only the successful attempt's card was ever delivered",
           sum(1 for c in cards_drawn if c["username"] == "flaky") == 2 and reads == [])
+
+    # ==================================================================
+    section("TEST 12  ·  a 429 pauses every Instagram read, then resumes")
+    reset()
+    wire_channel(1)
+    B.jobs.append(new_active_job("ZM-3001", "first"))
+    B.jobs.append(new_active_job("ZM-3002", "second"))
+    B.jobs.append(new_active_job("ZM-3003", "third"))
+    B.save_jobs()
+    script["first"] = [(429, {})]
+    script["second"] = [(200, profile("second", 1, 1, 1))]
+    script["third"] = [(200, profile("third", 1, 1, 1))]
+    B.MONITOR_CONCURRENCY = 1  # deterministic order: first, second, third
+    try:
+        asyncio.run(tick())
+        check("after the 429, no further read went out in the same tick",
+              reads == ["first"], reads)
+        check("every job is still active - a pause is not an answer",
+              all(j["status"] == "active" for j in B.jobs))
+        check("the pause is never stored as a job state on disk",
+              all(j["status"] == "active" for j in disk()))
+        check("the dashboard shows 'Could not check', never 'Not reachable'",
+              all(B.job_state_text(j) == "Could not check" for j in B.jobs),
+              [B.job_state_text(j) for j in B.jobs])
+        script["first"] = [(200, profile("first", 1, 1, 1))]
+        asyncio.run(tick())
+        check("reads resume once the pause has passed, and all three complete",
+              all(j["status"] == "completed" for j in B.jobs))
+    finally:
+        B.MONITOR_CONCURRENCY = 3
+
+    # ==================================================================
+    section("TEST 13  ·  the handle now belongs to a different account")
+    reset()
+    wire_channel(1)
+    squat = new_active_job("ZM-3101", "taken.over")
+    squat["ig_user_id"] = "id-original-owner"
+    B.jobs.append(squat)
+    B.save_jobs()
+    script["taken.over"] = [(200, profile("taken.over", 5, 5, 5))]  # id-taken.over
+    for _ in range(3):
+        asyncio.run(tick())
+    check("a reachable profile with a DIFFERENT numeric id is not auto-completed",
+          B.jobs[0]["status"] == "active" and channel_sends == [])
+    check("the stored id is not overwritten", B.jobs[0]["ig_user_id"] == "id-original-owner")
+    check("the mismatch is logged once, not every tick",
+          sum("different Instagram account" in l for l in log_lines) == 1)
+    check("the dashboard says so", B.job_state_text(B.jobs[0]).startswith("Handle now on"))
+
+    section("TEST 14  ·  a completion stores the Instagram numeric id")
+    reset()
+    wire_channel(1)
+    B.jobs.append(new_active_job("ZM-3201", "came.back"))  # gone at creation: no id
+    B.save_jobs()
+    script["came.back"] = [(200, profile("came.back", 9, 9, 9))]
+    asyncio.run(tick())
+    check("auto-completion records ig_user_id from the confirming read",
+          disk()[0].get("ig_user_id") == "id-came.back" and disk()[0]["status"] == "completed")
 
     if S.FAILURES:
         print(f"\n{len(S.FAILURES)} check(s) FAILED:")

@@ -88,9 +88,11 @@ class abc:
     class User: pass
 
 class Intents:
-    def __init__(self): self.message_content = False
+    def __init__(self): self.message_content = False; self.guilds = False
     @classmethod
     def default(cls): return cls()
+    @classmethod
+    def none(cls): return cls()
 
 class Object:
     def __init__(self, id=None): self.id = id
@@ -187,6 +189,8 @@ class CommandInvokeError(AppCommandError): pass
 '''
 
 COMMANDS_STUB = '''
+def when_mentioned(bot, msg): return []
+
 class Bot:
     def __init__(self, *a, **kw):
         self.user = None
